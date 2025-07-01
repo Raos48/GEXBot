@@ -1,0 +1,124 @@
+# docker-compose.yml (Versão revisada)
+
+services:
+  nginx:
+    build:
+      context: .
+      dockerfile: Dockerfile.nginx
+    ports:
+      - "8000:80"
+    volumes:
+      - staticfiles_volume:/app/staticfiles
+      - media_volume:/app/media
+    depends_on:
+      - web
+    restart: unless-stopped
+
+  db:
+    image: mysql:8.0
+    volumes:
+      - db_data:/var/lib/mysql
+    environment:
+      - MYSQL_DATABASE=${DB_NAME}
+      - MYSQL_USER=${DB_USER}
+      - MYSQL_PASSWORD=${DB_PASSWORD}
+      - MYSQL_ROOT_PASSWORD=${DB_PASSWORD}
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost"]
+      timeout: 20s
+      retries: 10
+
+  redis:
+    image: redis:7.4-alpine # Versão específica para consistência
+    ports:
+      - "6379:6379"
+    # Removido comando default que estava causando warning
+    volumes:
+      - redis_data:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  web:
+    build: .
+    # Comando CORRETO para migrar e iniciar Gunicorn
+    command: >
+      sh -c "python manage.py collectstatic --noinput &&
+             python manage.py migrate --noinput &&
+             gunicorn whatsapp_scheduler.wsgi:application --bind 0.0.0.0:8000"
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - staticfiles_volume:/app/staticfiles
+      - media_volume:/app/media
+      - ./logs:/app/logs
+    environment:
+      - SECRET_KEY=${SECRET_KEY}
+      - DEBUG=${DEBUG}
+      - DB_HOST=db
+      - DB_NAME=${DB_NAME}
+      - DB_USER=${DB_USER}
+      - DB_PASSWORD=${DB_PASSWORD}
+      - CELERY_BROKER_URL=redis://redis:6379/0
+      - CELERY_RESULT_BACKEND=redis://redis:6379/0
+      - DJANGO_SETTINGS_MODULE=whatsapp_scheduler.settings
+      - DOCKER=True
+    restart: unless-stopped
+
+  celery_worker:
+    build: .
+    command: celery -A whatsapp_scheduler worker --loglevel=info
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - ./logs:/app/logs
+    environment:
+      - SECRET_KEY=${SECRET_KEY}
+      - DB_HOST=db
+      - DB_NAME=${DB_NAME}
+      - DB_USER=${DB_USER}
+      - DB_PASSWORD=${DB_PASSWORD}
+      - CELERY_BROKER_URL=redis://redis:6379/0
+      - CELERY_RESULT_BACKEND=redis://redis:6379/0
+      - DJANGO_SETTINGS_MODULE=whatsapp_scheduler.settings
+      - DOCKER=True
+    restart: unless-stopped
+
+  celery_beat:
+    build: .
+    # Comando SIMPLIFICADO. O scheduler é pego do settings.py
+    command: celery -A whatsapp_scheduler beat -l info
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - ./logs:/app/logs
+    environment:
+      - SECRET_KEY=${SECRET_KEY}
+      - DB_HOST=db
+      - DB_NAME=${DB_NAME}
+      - DB_USER=${DB_USER}
+      - DB_PASSWORD=${DB_PASSWORD}
+      - CELERY_BROKER_URL=redis://redis:6379/0
+      - CELERY_RESULT_BACKEND=redis://redis:6379/0
+      - DJANGO_SETTINGS_MODULE=whatsapp_scheduler.settings
+      - DOCKER=True
+    restart: unless-stopped
+
+volumes:
+  redis_data:
+  db_data:
+  staticfiles_volume:
+  media_volume:

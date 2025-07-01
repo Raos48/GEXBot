@@ -1,0 +1,16 @@
+# .dockerignore
+
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.env
+db.sqlite3
+celerybeat-schedule*
+logs/
+media/
+staticfiles_volume/
+db_data/
+redis_data/
+.git/
+.vscode/
