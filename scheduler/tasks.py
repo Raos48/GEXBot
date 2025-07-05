@@ -1,55 +1,114 @@
-# scheduler/tasks.py (VERSÃO REVISADA E CORRIGIDA)
-
-from celery import shared_task
-import requests
-from django.conf import settings
 import logging
-from .utils.scheduler_utils import format_phone_number
+from celery import shared_task
+from django.utils import timezone
+from django.db import transaction
+from .models import ScheduledMessage, MessageLog
+from .services.evolution_service import EvolutionAPIService
 
 logger = logging.getLogger(__name__)
 
-@shared_task
-def send_whatsapp_message(phone_number, message, instance_name=None):
-    """
-    Task do Celery para enviar mensagem WhatsApp via Evolution API
-    """
+@shared_task(bind=True, max_retries=3, default_retry_delay=60)
+def process_scheduled_message(self, schedule_id):
     try:
-        if not instance_name:
-            instance_name = settings.EVOLUTION_INSTANCE_NAME
-        
-        api_url = settings.EVOLUTION_API_BASE_URL
-        api_key = settings.EVOLUTION_API_KEY
-        
-        url = f"{api_url}/message/sendText/{instance_name}"
-        
-        headers = {
-            'Content-Type': 'application/json',
-            'apikey': api_key
-        }
-        
-        formatted_number = format_phone_number(phone_number)
-        
-        # CORRIGIDO: Payload simplificado conforme a mensagem de erro da API
-        payload = {
-            "number": formatted_number,
-            "text": message 
-        }
-        
-        response = requests.post(url, json=payload, headers=headers, timeout=30)
-        
-        if response.status_code in [200, 201]:
-            logger.info(f"Mensagem enviada com sucesso para {formatted_number}")
-            return {"status": "success", "response": response.json()}
-        else:
-            logger.error(f"Erro ao enviar mensagem para {formatted_number}: {response.status_code} - {response.text}")
-            return {"status": "error", "message": f"Erro HTTP {response.status_code}"}
-            
-    except Exception as e:
-        logger.error(f"Erro fatal na task send_whatsapp_message: {str(e)}")
-        return {"status": "error", "message": str(e)}
+        with transaction.atomic():
+            scheduled_message = ScheduledMessage.objects.select_for_update().get(id=schedule_id)
+    except ScheduledMessage.DoesNotExist:
+        logger.error(f"ScheduledMessage with ID {schedule_id} not found.")
+        return
 
-@shared_task
-def test_task():
-    """Task de teste"""
-    logger.info("Executando task de teste!")
-    return "Task de teste funcionando!"
+    if scheduled_message.status != 'active':
+        logger.info(f"ScheduledMessage {schedule_id} is not active. Status: {scheduled_message.status}. Skipping execution.")
+        return
+
+    message_template = scheduled_message.message_template
+    recipients_data = []
+
+    if scheduled_message.recipient_type == 'contact' and scheduled_message.contact:
+        recipients_data.append({
+            'phone_number': scheduled_message.contact.phone_number,
+            'name': scheduled_message.contact.name
+        })
+    elif scheduled_message.recipient_type == 'group' and scheduled_message.group:
+        recipients_data.append({
+            'phone_number': scheduled_message.group.group_id,
+            'name': scheduled_message.group.name
+        })
+    else:
+        logger.warning(f"ScheduledMessage {schedule_id} has invalid recipient configuration.")
+        scheduled_message.status = 'failed'
+        scheduled_message.save(update_fields=['status'])
+        return
+
+    if not recipients_data:
+        logger.warning(f"ScheduledMessage {schedule_id} has no valid recipients. Skipping send.")
+        scheduled_message.status = 'failed'
+        scheduled_message.save(update_fields=['status'])
+        return
+
+    evolution_service = EvolutionAPIService()
+    all_recipients_sent_successfully = True
+
+    for recipient_info in recipients_data:
+        recipient_phone = recipient_info['phone_number']
+        recipient_name = recipient_info['name']
+
+        log_entry = MessageLog.objects.create(
+            scheduled_message=scheduled_message,
+            recipient=recipient_phone,
+            status='pending'
+        )
+        try:
+            response_data = None
+            if message_template.media_type == 'text':
+                response_data = evolution_service.send_text_message(
+                    recipient_phone,
+                    message_template.content
+                )
+            elif message_template.media_type in ['image', 'video', 'document'] and message_template.media_file:
+                media_url = scheduled_message.message_template.media_file.url
+                response_data = evolution_service.send_media_message(
+                    recipient_phone,
+                    message_template.content,
+                    media_url,
+                    message_template.media_type
+                )
+            else:
+                raise ValueError(f"Tipo de mídia '{message_template.media_type}' não suportado ou arquivo ausente para {scheduled_message.id}.")
+
+            if response_data and response_data.get('success'):
+                log_entry.status = 'sent'
+                log_entry.evolution_message_id = response_data.get('data', {}).get('key', {}).get('id')
+                logger.info(f"Message {log_entry.id} sent successfully for schedule {schedule_id} to {recipient_phone}.")
+            else:
+                log_entry.status = 'failed'
+                error_msg = response_data.get('error', 'Unknown API error') if response_data else 'No response from API'
+                log_entry.error_message = f"API Error: {error_msg}"
+                logger.error(f"Failed to send message {log_entry.id} for schedule {schedule_id} to {recipient_phone}: {log_entry.error_message}")
+                all_recipients_sent_successfully = False
+
+        except Exception as e:
+            log_entry.status = 'failed'
+            log_entry.error_message = f"Exceção na task: {e}"
+            logger.error(f"Exception sending message {log_entry.id} for schedule {schedule_id} to {recipient_phone}: {e}", exc_info=True)
+            all_recipients_sent_successfully = False
+        finally:
+            log_entry.sent_at = timezone.now()
+            log_entry.save()
+
+    scheduled_message.last_sent = timezone.now()
+    next_run = scheduled_message.calculate_next_execution()
+    scheduled_message.next_execution = next_run
+
+    if not next_run:
+        if scheduled_message.frequency == 'once' and all_recipients_sent_successfully:
+            scheduled_message.status = 'completed'
+        elif scheduled_message.frequency != 'once' and scheduled_message.end_date and scheduled_message.last_sent >= scheduled_message.end_date:
+            scheduled_message.status = 'completed'
+        else:
+            scheduled_message.status = 'failed'
+
+    if not all_recipients_sent_successfully and scheduled_message.frequency == 'once':
+        scheduled_message.status = 'failed'
+
+    scheduled_message.save(update_fields=['status', 'last_sent', 'next_execution'])
+    logger.info(f"ScheduledMessage {schedule_id} processed. Next execution: {scheduled_message.next_execution}")

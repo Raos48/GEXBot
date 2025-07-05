@@ -1,9 +1,8 @@
-# scheduler/signals.py (VERSÃO CORRIGIDA E COMPLETA)
-
+# scheduler/signals.py
 import json
 from django.db.models.signals import post_save, post_delete
 from django.dispatch import receiver
-from django_celery_beat.models import PeriodicTask, IntervalSchedule, CrontabSchedule, ClockedSchedule
+from django_celery_beat.models import PeriodicTask, CrontabSchedule, ClockedSchedule
 from .models import ScheduledMessage
 
 @receiver(post_save, sender=ScheduledMessage)
@@ -13,85 +12,70 @@ def create_or_update_periodic_task(sender, instance, created, **kwargs):
     ScheduledMessage é salvo.
     """
     task_name = f'whatsapp-schedule-{instance.id}'
-
-    # Se o agendamento está inativo ou completo, simplesmente desabilitamos a tarefa e saímos.
+    # Se o agendamento não estiver 'ativo', desabilitamos a tarefa e saímos.
     if instance.status != 'active':
-        try:
-            ptask = PeriodicTask.objects.get(name=task_name)
-            ptask.enabled = False
-            ptask.save()
-        except PeriodicTask.DoesNotExist:
-            pass  # Se a tarefa não existe, não há nada a fazer.
+        PeriodicTask.objects.filter(name=task_name).update(enabled=False)
         return
 
-    # Lógica para determinar o tipo de agendamento (schedule)
     schedule = None
     schedule_type = None
 
     if instance.frequency == 'once':
-        # Para execução única, usamos ClockedSchedule
         schedule, _ = ClockedSchedule.objects.get_or_create(clocked_time=instance.start_date)
         schedule_type = 'clocked'
-    
+
     elif instance.frequency == 'daily':
-        # Para execuções diárias, usamos CrontabSchedule
         schedule, _ = CrontabSchedule.objects.get_or_create(
-            minute=instance.start_date.minute,
-            hour=instance.start_date.hour,
-            day_of_week='*',
-            day_of_month='*',
-            month_of_year='*',
+            minute=instance.start_date.minute, hour=instance.start_date.hour,
+            day_of_week='*', day_of_month='*', month_of_year='*'
         )
         schedule_type = 'crontab'
 
-    elif instance.frequency == 'weekly':
-        # Para execuções semanais
+    elif instance.frequency == 'weekly' and instance.day_of_week is not None:
         schedule, _ = CrontabSchedule.objects.get_or_create(
-            minute=instance.start_date.minute,
-            hour=instance.start_date.hour,
-            day_of_week=instance.day_of_week,
-        )
-        schedule_type = 'crontab'
-        
-    elif instance.frequency == 'monthly':
-        # Para execuções mensais
-        schedule, _ = CrontabSchedule.objects.get_or_create(
-            minute=instance.start_date.minute,
-            hour=instance.start_date.hour,
-            day_of_month=instance.day_of_month,
+            minute=instance.start_date.minute, hour=instance.start_date.hour,
+            day_of_week=instance.day_of_week
         )
         schedule_type = 'crontab'
 
-    # Se não houver um tipo de agendamento válido, não fazemos nada
+    elif instance.frequency == 'monthly' and instance.day_of_month is not None:
+        schedule, _ = CrontabSchedule.objects.get_or_create(
+            minute=instance.start_date.minute, hour=instance.start_date.hour,
+            day_of_month=instance.day_of_month
+        )
+        schedule_type = 'crontab'
+
+    # <<< ADICIONADO ESTE BLOCO PARA CORRIGIR A FALHA >>>
+    elif instance.frequency == 'yearly':
+        schedule, _ = CrontabSchedule.objects.get_or_create(
+            minute=instance.start_date.minute,
+            hour=instance.start_date.hour,
+            day_of_month=instance.start_date.day,
+            month_of_year=instance.start_date.month
+        )
+        schedule_type = 'crontab'
+    # <<< FIM DO BLOCO ADICIONADO >>>
+
     if not schedule_type:
+        # Se a frequência não for válida ou não tiver os dados necessários, desabilita e sai
+        PeriodicTask.objects.filter(name=task_name).update(enabled=False)
         return
 
-    # Prepara os argumentos para a task do Celery
-    recipient_number = instance.contact.phone_number if instance.contact else instance.group.group_id
-    task_args = json.dumps([recipient_number, instance.message_template.content])
-
-    # Prepara os campos para a PeriodicTask
     task_data = {
-        'task': 'scheduler.tasks.send_whatsapp_message',
+        'task': 'scheduler.tasks.process_scheduled_message',
         'name': task_name,
-        'args': task_args,
+        'kwargs': json.dumps({'schedule_id': str(instance.id)}),
+        'args': '[]',
         'enabled': True,
         'one_off': instance.frequency == 'once',
-        # Zera os outros tipos de agendamento para evitar conflitos
-        'interval': None,
-        'crontab': None,
-        'solar': None,
-        'clocked': None,
     }
-    
-    # Atribui o schedule ao campo correto
-    task_data[schedule_type] = schedule
 
-    # Usa update_or_create para criar ou atualizar a tarefa de forma atômica
-    PeriodicTask.objects.update_or_create(
-        name=task_name,
-        defaults=task_data
-    )
+    # Limpa os campos de agendamento antes de definir o correto
+    task_data.update({
+        'interval': None, 'crontab': None, 'solar': None, 'clocked': None
+    })
+    task_data[schedule_type] = schedule
+    PeriodicTask.objects.update_or_create(name=task_name, defaults=task_data)
 
 @receiver(post_delete, sender=ScheduledMessage)
 def delete_periodic_task(sender, instance, **kwargs):
@@ -99,8 +83,4 @@ def delete_periodic_task(sender, instance, **kwargs):
     Deleta a PeriodicTask correspondente quando um ScheduledMessage é deletado.
     """
     task_name = f'whatsapp-schedule-{instance.id}'
-    try:
-        ptask = PeriodicTask.objects.get(name=task_name)
-        ptask.delete()
-    except PeriodicTask.DoesNotExist:
-        pass  # A tarefa não existe mais, nada a fazer.
+    PeriodicTask.objects.filter(name=task_name).delete()

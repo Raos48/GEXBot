@@ -1,6 +1,4 @@
-# backend/docker-compose.yml (VERSÃO REFATORADA)
-# Este arquivo gerencia os serviços da aplicação (Nginx, Django, Celery, Redis).
-# ELE NÃO CONTÉM MAIS O BANCO DE DADOS.
+# docker-compose.yml (Versão com serviço de migração dedicado)
 
 services:
   nginx:
@@ -15,8 +13,25 @@ services:
     depends_on:
       - web
     restart: unless-stopped
-    networks: # Adicionado à rede compartilhada
-      - gexbot-network
+
+  db:
+    image: mysql:8.0
+    command:
+      - --default-authentication-plugin=mysql_native_password
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_unicode_ci
+    volumes:
+      - db_data:/var/lib/mysql
+    environment:
+      - MYSQL_DATABASE=${DB_NAME}
+      - MYSQL_USER=${DB_USER}
+      - MYSQL_PASSWORD=${DB_PASSWORD}
+      - MYSQL_ROOT_PASSWORD=${MYSQL_ROOT_PASSWORD} 
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "root", "-p${MYSQL_ROOT_PASSWORD}"]
+      timeout: 20s
+      retries: 10
 
   redis:
     image: redis:7.4-alpine
@@ -30,34 +45,32 @@ services:
       interval: 30s
       timeout: 10s
       retries: 3
-    networks: # Adicionado à rede compartilhada
-      - gexbot-network
 
+  # NOVO SERVIÇO: Apenas para rodar migrações
   migrate:
     build: .
     command: python manage.py migrate
     depends_on:
-      redis:
+      db:
         condition: service_healthy
     volumes:
       - .:/app
     environment:
       - SECRET_KEY=${SECRET_KEY}
       - DEBUG=${DEBUG}
-      - DB_HOST=${DB_HOST}
-      - DB_PORT=${DB_PORT}
+      - DB_HOST=db
       - DB_NAME=${DB_NAME}
       - DB_USER=${DB_USER}
       - DB_PASSWORD=${DB_PASSWORD}
       - DJANGO_SETTINGS_MODULE=whatsapp_scheduler.settings
-    networks: # Adicionado à rede compartilhada
-      - gexbot-network
 
   web:
     build: .
+    # COMANDO SIMPLIFICADO: Apenas para rodar o servidor
     command: >
       sh -c "python manage.py collectstatic --noinput &&
-            gunicorn whatsapp_scheduler.wsgi:application --bind 0.0.0.0:8000"
+             gunicorn whatsapp_scheduler.wsgi:application --bind 0.0.0.0:8000"
+    # MUDANÇA AQUI: Agora depende do serviço 'migrate'
     depends_on:
       migrate:
         condition: service_completed_successfully
@@ -71,8 +84,7 @@ services:
     environment:
       - SECRET_KEY=${SECRET_KEY}
       - DEBUG=${DEBUG}
-      - DB_HOST=${DB_HOST} # ALTERADO
-      - DB_PORT=${DB_PORT} # ALTERADO
+      - DB_HOST=db
       - DB_NAME=${DB_NAME}
       - DB_USER=${DB_USER}
       - DB_PASSWORD=${DB_PASSWORD}
@@ -81,12 +93,11 @@ services:
       - DJANGO_SETTINGS_MODULE=whatsapp_scheduler.settings
       - DOCKER=True
     restart: unless-stopped
-    networks: # Adicionado à rede compartilhada
-      - gexbot-network
 
   celery_worker:
     build: .
     command: celery -A whatsapp_scheduler worker --loglevel=info
+    # MUDANÇA AQUI: Agora depende do serviço 'migrate'
     depends_on:
       migrate:
         condition: service_completed_successfully
@@ -97,8 +108,7 @@ services:
       - ./logs:/app/logs
     environment:
       - SECRET_KEY=${SECRET_KEY}
-      - DB_HOST=${DB_HOST} # ALTERADO
-      - DB_PORT=${DB_PORT} # ALTERADO
+      - DB_HOST=db
       - DB_NAME=${DB_NAME}
       - DB_USER=${DB_USER}
       - DB_PASSWORD=${DB_PASSWORD}
@@ -107,12 +117,11 @@ services:
       - DJANGO_SETTINGS_MODULE=whatsapp_scheduler.settings
       - DOCKER=True
     restart: unless-stopped
-    networks: # Adicionado à rede compartilhada
-      - gexbot-network
 
   celery_beat:
     build: .
     command: celery -A whatsapp_scheduler beat -l info
+    # MUDANÇA AQUI: Agora depende do serviço 'migrate'
     depends_on:
       migrate:
         condition: service_completed_successfully
@@ -123,8 +132,7 @@ services:
       - ./logs:/app/logs
     environment:
       - SECRET_KEY=${SECRET_KEY}
-      - DB_HOST=${DB_HOST} # ALTERADO
-      - DB_PORT=${DB_PORT} # ALTERADO
+      - DB_HOST=db
       - DB_NAME=${DB_NAME}
       - DB_USER=${DB_USER}
       - DB_PASSWORD=${DB_PASSWORD}
@@ -133,17 +141,9 @@ services:
       - DJANGO_SETTINGS_MODULE=whatsapp_scheduler.settings
       - DOCKER=True
     restart: unless-stopped
-    networks: # Adicionado à rede compartilhada
-      - gexbot-network
 
 volumes:
-  # REMOVIDO: O volume 'db_data' não é mais gerenciado por este arquivo.
   redis_data:
+  db_data:
   staticfiles_volume:
   media_volume:
-
-networks:
-  # ALTERAÇÃO CHAVE: Define que este compose usará uma rede externa já existente.
-  gexbot-network:
-    external: true
-    name: gexbot-shared-network # O mesmo nome da rede definida no compose do gexbd

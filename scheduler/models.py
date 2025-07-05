@@ -1,6 +1,8 @@
 from django.db import models
 from django.utils import timezone
+from datetime import timedelta
 import uuid
+import calendar
 
 class Contact(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
@@ -42,7 +44,6 @@ class MessageTemplate(models.Model):
         ('document', 'Documento'),
         ('audio', 'Áudio'),
     ]
-
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     title = models.CharField(max_length=100, verbose_name="Título")
     content = models.TextField(verbose_name="Conteúdo da Mensagem")
@@ -68,49 +69,100 @@ class ScheduledMessage(models.Model):
         ('monthly', 'Mensal'),
         ('yearly', 'Anual'),
     ]
-
     STATUS_CHOICES = [
         ('active', 'Ativo'),
         ('paused', 'Pausado'),
         ('completed', 'Concluído'),
         ('failed', 'Falhou'),
     ]
-
     RECIPIENT_TYPES = [
         ('contact', 'Contato'),
         ('group', 'Grupo'),
     ]
-
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     title = models.CharField(max_length=100, verbose_name="Título do Agendamento")
     message_template = models.ForeignKey(MessageTemplate, on_delete=models.CASCADE, verbose_name="Template da Mensagem")
-    
-    # Destinatário
     recipient_type = models.CharField(max_length=10, choices=RECIPIENT_TYPES, verbose_name="Tipo de Destinatário")
     contact = models.ForeignKey(Contact, on_delete=models.CASCADE, blank=True, null=True, verbose_name="Contato")
     group = models.ForeignKey(Group, on_delete=models.CASCADE, blank=True, null=True, verbose_name="Grupo")
-    
-    # Agendamento
     frequency = models.CharField(max_length=10, choices=FREQUENCY_CHOICES, verbose_name="Frequência")
     start_date = models.DateTimeField(verbose_name="Data/Hora de Início")
     end_date = models.DateTimeField(blank=True, null=True, verbose_name="Data/Hora de Fim")
-    
-    # Para agendamentos semanais (0=Segunda, 6=Domingo)
-    day_of_week = models.IntegerField(blank=True, null=True, verbose_name="Dia da Semana")
-    
-    # Para agendamentos mensais (1-31)
+    day_of_week = models.IntegerField(blank=True, null=True, verbose_name="Dia da Semana (0-6)")
     day_of_month = models.IntegerField(blank=True, null=True, verbose_name="Dia do Mês")
-    
-    # Status
     status = models.CharField(max_length=10, choices=STATUS_CHOICES, default='active', verbose_name="Status")
     last_sent = models.DateTimeField(blank=True, null=True, verbose_name="Último Envio")
     next_execution = models.DateTimeField(blank=True, null=True, verbose_name="Próxima Execução")
-    
     created_at = models.DateTimeField(auto_now_add=True, verbose_name="Criado em")
     updated_at = models.DateTimeField(auto_now=True, verbose_name="Atualizado em")
 
     def __str__(self):
         return f"{self.title} - {self.get_frequency_display()}"
+
+    def calculate_next_execution(self):
+        if self.status != 'active':
+            return None
+        now = timezone.now()
+        base_time = self.next_execution or self.start_date
+        if base_time < now:
+            base_time = now
+        if self.frequency == 'once':
+            return None
+        elif self.frequency == 'daily':
+            next_time = base_time + timedelta(days=1)
+            return next_time.replace(hour=self.start_date.hour, minute=self.start_date.minute, second=0, microsecond=0)
+        elif self.frequency == 'weekly':
+            if self.day_of_week is None:
+                return None
+            next_time = base_time
+            while True:
+                next_time += timedelta(days=1)
+                if next_time.weekday() == self.day_of_week:
+                    return next_time.replace(hour=self.start_date.hour, minute=self.start_date.minute, second=0, microsecond=0)
+        elif self.frequency == 'monthly':
+            if not self.day_of_month:
+                return None
+            next_time = base_time
+            year, month = next_time.year, next_time.month
+            last_day_this_month = calendar.monthrange(year, month)[1]
+            day = min(self.day_of_month, last_day_this_month)
+            potential_date = next_time.replace(day=day)
+            if potential_date <= base_time:
+                month += 1
+                if month > 12:
+                    month = 1
+                    year += 1
+                last_day_next_month = calendar.monthrange(year, month)[1]
+                day = min(self.day_of_month, last_day_next_month)
+                next_time = potential_date.replace(year=year, month=month, day=day)
+            else:
+                next_time = potential_date
+            return next_time.replace(hour=self.start_date.hour, minute=self.start_date.minute, second=0, microsecond=0)
+        elif self.frequency == 'yearly':
+            next_time = base_time
+            target_year = next_time.year
+            try:
+                potential_date = next_time.replace(month=self.start_date.month, day=self.start_date.day)
+                if potential_date <= base_time:
+                    target_year += 1
+            except ValueError:
+                if base_time.month > self.start_date.month:
+                    target_year += 1
+            while True:
+                try:
+                    return next_time.replace(year=target_year, month=self.start_date.month, day=self.start_date.day,
+                                            hour=self.start_date.hour, minute=self.start_date.minute, second=0, microsecond=0)
+                except ValueError:
+                    target_year += 1
+        return None
+
+    def save(self, *args, **kwargs):
+        if not self.pk or not self.next_execution:
+            if self.status == 'active':
+                self.next_execution = self.start_date
+            else:
+                self.next_execution = None
+        super().save(*args, **kwargs)
 
     class Meta:
         verbose_name = "Mensagem Agendada"
@@ -125,10 +177,9 @@ class MessageLog(models.Model):
         ('delivered', 'Entregue'),
         ('read', 'Lido'),
     ]
-
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     scheduled_message = models.ForeignKey(ScheduledMessage, on_delete=models.CASCADE, verbose_name="Mensagem Agendada")
-    recipient = models.CharField(max_length=100, verbose_name="Destinatário")  # Phone number or group ID
+    recipient = models.CharField(max_length=100, verbose_name="Destinatário")
     status = models.CharField(max_length=10, choices=STATUS_CHOICES, default='pending', verbose_name="Status")
     sent_at = models.DateTimeField(auto_now_add=True, verbose_name="Enviado em")
     delivered_at = models.DateTimeField(blank=True, null=True, verbose_name="Entregue em")
